@@ -1,0 +1,266 @@
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class TrafficSimTuned {
+
+    
+    static final int SIM_TIME = 1800; 
+    static final int P = 2;           
+    
+    static final int BASE_GREEN = 30;
+    
+    static final int BASE_CYCLE = 120;
+    static final int MIN_GREEN = 10;
+    static final int MAX_GREEN = 60;
+    static final double[] WEIGHTS = {1.5, 1.0, 1.5, 1.0};
+    static final int BONUS_SECONDS = 10;
+
+    
+    static int poissonRandom(double lambda, Random rnd) {
+        double L = Math.exp(-lambda);
+        int k = 0;
+        double p = 1.0;
+        while (p > L) {
+            k++;
+            p *= rnd.nextDouble();
+        }
+        return k - 1;
+    }
+
+    
+    static class Outcome {
+        double avgWait;
+        int totalCleared;
+        int[] remaining;
+        Outcome(double aw, int tc, int[] rem) { avgWait = aw; totalCleared = tc; remaining = rem; }
+    }
+
+    
+    static Outcome runScenario(int[] init, int[] ratePerMin, String mode, boolean stochastic, long seed) {
+        Random rnd = (seed >= 0) ? new Random(seed) : new Random();
+        @SuppressWarnings("unchecked") Deque<Integer>[] queues = new ArrayDeque[4];
+        for (int i = 0; i < 4; i++) {
+            queues[i] = new ArrayDeque<>();
+            for (int k = 0; k < init[i]; k++) queues[i].addLast(0); // arrival time 0
+        }
+        int time = 0;
+        int nextMinute = 60;
+        long totalCleared = 0;
+        double totalWait = 0.0;
+
+        while (time < SIM_TIME) {
+            // add arrivals at each minute mark
+            if (time % 60 == 0 && time > 0) {
+                for (int i = 0; i < 4; i++) {
+                    int arr = stochastic ? poissonRandom(ratePerMin[i], rnd) : ratePerMin[i];
+                    for (int a = 0; a < arr; a++) queues[i].addLast(time);
+                }
+            }
+
+            if (mode.equals("tuned")) {
+
+                double wqNS = WEIGHTS[0] * queues[0].size() + WEIGHTS[2] * queues[2].size();
+                double wqEW = WEIGHTS[1] * queues[1].size() + WEIGHTS[3] * queues[3].size();
+                double total = wqNS + wqEW;
+                if (total == 0) {
+
+                    if (nextMinute <= SIM_TIME) {
+                        time = nextMinute;
+                        for (int i = 0; i < 4; i++) {
+                            int arr = stochastic ? poissonRandom(ratePerMin[i], rnd) : ratePerMin[i];
+                            for (int a = 0; a < arr; a++) queues[i].addLast(time);
+                        }
+                        nextMinute += 60;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                int gNS = (int) Math.round(BASE_CYCLE * (wqNS / total));
+                int gEW = BASE_CYCLE - gNS;
+                if (gNS < 2 * MIN_GREEN) gNS = 2 * MIN_GREEN;
+                if (gEW < 2 * MIN_GREEN) gEW = 2 * MIN_GREEN;
+
+
+                {
+                    int laneA = 0, laneB = 2;
+                    double wa = WEIGHTS[laneA] * queues[laneA].size();
+                    double wb = WEIGHTS[laneB] * queues[laneB].size();
+                    int ga = (wa + wb == 0) ? gNS/2 : (int) Math.round(gNS * (wa / (wa + wb)));
+                    int gb = gNS - ga;
+                    ga = Math.max(MIN_GREEN, Math.min(MAX_GREEN, ga));
+                    gb = Math.max(MIN_GREEN, Math.min(MAX_GREEN, gb));
+                    double avgOtherA = (queues[(laneA+1)%4].size() + queues[(laneA+2)%4].size() + queues[(laneA+3)%4].size()) / 3.0;
+                    if (queues[laneA].size() > 2 * avgOtherA) ga = Math.min(MAX_GREEN, ga + BONUS_SECONDS);
+                    double avgOtherB = (queues[(laneB+1)%4].size() + queues[(laneB+2)%4].size() + queues[(laneB+3)%4].size()) / 3.0;
+                    if (queues[laneB].size() > 2 * avgOtherB) gb = Math.min(MAX_GREEN, gb + BONUS_SECONDS);
+                    int capA = ga / P;
+                    int capB = gb / P;
+                    int usedA = Math.min(capA, queues[laneA].size());
+                    int usedB = Math.min(capB, queues[laneB].size());
+                    int leftover = (capA - usedA) + (capB - usedB);
+                    if (leftover > 0) {
+                        int needA = Math.max(0, queues[laneA].size() - usedA);
+                        int needB = Math.max(0, queues[laneB].size() - usedB);
+                        if (needA >= needB) {
+                            int addA = Math.min(leftover, needA);
+                            usedA += addA; leftover -= addA;
+                        }
+                        if (leftover > 0 && needB > 0) {
+                            int addB = Math.min(leftover, needB);
+                            usedB += addB; leftover -= addB;
+                        }
+                    }
+                    for (int k = 0; k < usedA; k++) {
+                        int arrival = queues[laneA].pollFirst();
+                        totalWait += (time + (k+1)*P - arrival);
+                    }
+                    for (int k = 0; k < usedB; k++) {
+                        int arrival = queues[laneB].pollFirst();
+                        totalWait += (time + (k+1)*P - arrival);
+                    }
+                    totalCleared += usedA + usedB;
+                    time += Math.max(ga, gb);
+
+                    while (nextMinute <= time && nextMinute <= SIM_TIME) {
+                        for (int i = 0; i < 4; i++) {
+                            int arr = stochastic ? poissonRandom(ratePerMin[i], rnd) : ratePerMin[i];
+                            for (int a = 0; a < arr; a++) queues[i].addLast(nextMinute);
+                        }
+                        nextMinute += 60;
+                    }
+                }
+                if (time >= SIM_TIME) break;
+                
+
+                {
+                    int laneA = 1, laneB = 3;
+                    double wa = WEIGHTS[laneA] * queues[laneA].size();
+                    double wb = WEIGHTS[laneB] * queues[laneB].size();
+                    int ga = (wa + wb == 0) ? gEW/2 : (int) Math.round(gEW * (wa / (wa + wb)));
+                    int gb = gEW - ga;
+                    ga = Math.max(MIN_GREEN, Math.min(MAX_GREEN, ga));
+                    gb = Math.max(MIN_GREEN, Math.min(MAX_GREEN, gb));
+                    double avgOtherA = (queues[(laneA+1)%4].size() + queues[(laneA+2)%4].size() + queues[(laneA+3)%4].size()) / 3.0;
+                    if (queues[laneA].size() > 2 * avgOtherA) ga = Math.min(MAX_GREEN, ga + BONUS_SECONDS);
+                    double avgOtherB = (queues[(laneB+1)%4].size() + queues[(laneB+2)%4].size() + queues[(laneB+3)%4].size()) / 3.0;
+                    if (queues[laneB].size() > 2 * avgOtherB) gb = Math.min(MAX_GREEN, gb + BONUS_SECONDS);
+                    int capA = ga / P;
+                    int capB = gb / P;
+                    int usedA = Math.min(capA, queues[laneA].size());
+                    int usedB = Math.min(capB, queues[laneB].size());
+                    int leftover = (capA - usedA) + (capB - usedB);
+                    if (leftover > 0) {
+                        int needA = Math.max(0, queues[laneA].size() - usedA);
+                        int needB = Math.max(0, queues[laneB].size() - usedB);
+                        if (needA >= needB) {
+                            int addA = Math.min(leftover, needA);
+                            usedA += addA; leftover -= addA;
+                        }
+                        if (leftover > 0 && needB > 0) {
+                            int addB = Math.min(leftover, needB);
+                            usedB += addB; leftover -= addB;
+                        }
+                    }
+                    for (int k = 0; k < usedA; k++) {
+                        int arrival = queues[laneA].pollFirst();
+                        totalWait += (time + (k+1)*P - arrival);
+                    }
+                    for (int k = 0; k < usedB; k++) {
+                        int arrival = queues[laneB].pollFirst();
+                        totalWait += (time + (k+1)*P - arrival);
+                    }
+                    totalCleared += usedA + usedB;
+                    time += Math.max(ga, gb);
+                    while (nextMinute <= time && nextMinute <= SIM_TIME) {
+                        for (int i = 0; i < 4; i++) {
+                            int arr = stochastic ? poissonRandom(ratePerMin[i], rnd) : ratePerMin[i];
+                            for (int a = 0; a < arr; a++) queues[i].addLast(nextMinute);
+                        }
+                        nextMinute += 60;
+                    }
+                }
+            } else {
+
+                for (int lane = 0; lane < 4; lane++) {
+                    int green = BASE_GREEN;
+                    if (mode.equals("proportional")) {
+                        int totalQ = queues[0].size() + queues[1].size() + queues[2].size() + queues[3].size();
+                        if (totalQ > 0) {
+                            green = (int) Math.round((double)BASE_GREEN * queues[lane].size() / totalQ);
+                            green = Math.max(15, Math.min(90, green));
+                        }
+                    } else if (mode.equals("subtractive")) {
+                        if (queues[lane].size() <= 5) green = BASE_GREEN / 2;
+                    }
+                    int canClear = green / P;
+                    int clearedNow = Math.min(canClear, queues[lane].size());
+                    for (int k = 0; k < clearedNow; k++) {
+                        int arrival = queues[lane].pollFirst();
+                        totalWait += (time + (k+1)*P - arrival);
+                    }
+                    totalCleared += clearedNow;
+                    time += green;
+                    while (nextMinute <= time && nextMinute <= SIM_TIME) {
+                        for (int i = 0; i < 4; i++) {
+                            int arr = stochastic ? poissonRandom(ratePerMin[i], rnd) : ratePerMin[i];
+                            for (int a = 0; a < arr; a++) queues[i].addLast(nextMinute);
+                        }
+                        nextMinute += 60;
+                    }
+                    if (time >= SIM_TIME) break;
+                }
+            }
+        }
+        int[] rem = new int[4];
+        for (int i = 0; i < 4; i++) rem[i] = queues[i].size();
+        double avgWait = totalCleared > 0 ? totalWait / totalCleared : 0.0;
+        return new Outcome(avgWait, (int)totalCleared, rem);
+    }
+
+    // Small wrapper: simplified tuned-run examples in main
+    public static void main(String[] args) {
+        int[] init = {30,10,25,5};
+        int[] rates = {20,5,15,3};
+
+        // run deterministic single runs
+        Outcome s = runScenario(init, rates, "static", false, 42);
+        Outcome d = runScenario(init, rates, "proportional", false, 42); // dynamic
+        Outcome sub = runScenario(init, rates, "subtractive", false, 42);
+        Outcome t = runScenario(init, rates, "tuned", false, 42);
+
+        System.out.println("==== Single deterministic run ====");
+        System.out.println("Static      : cleared=" + s.totalCleared + " avgWait=" + s.avgWait + " remaining=" + Arrays.toString(s.remaining));
+        System.out.println("Dynamic     : cleared=" + d.totalCleared + " avgWait=" + d.avgWait + " remaining=" + Arrays.toString(d.remaining));
+        System.out.println("Subtractive : cleared=" + sub.totalCleared + " avgWait=" + sub.avgWait + " remaining=" + Arrays.toString(sub.remaining));
+        System.out.println("Tuned       : cleared=" + t.totalCleared + " avgWait=" + t.avgWait + " remaining=" + Arrays.toString(t.remaining));
+
+
+        int runs = 30;
+        double sumStaticWait = 0, sumDynamicWait = 0, sumSubWait = 0, sumTunedWait = 0;
+        double sumStaticCleared = 0, sumDynamicCleared = 0, sumSubCleared = 0, sumTunedCleared = 0;
+
+        for (int i = 0; i < runs; i++) {
+            Outcome srun = runScenario(init, rates, "static", true, 1000 + i);
+            Outcome drun = runScenario(init, rates, "proportional", true, 2000 + i);
+            Outcome subrun = runScenario(init, rates, "subtractive", true, 3000 + i);
+            Outcome trun = runScenario(init, rates, "tuned", true, 4000 + i);
+
+            sumStaticWait += srun.avgWait;
+            sumDynamicWait += drun.avgWait;
+            sumSubWait += subrun.avgWait;
+            sumTunedWait += trun.avgWait;
+
+            sumStaticCleared += srun.totalCleared;
+            sumDynamicCleared += drun.totalCleared;
+            sumSubCleared += subrun.totalCleared;
+            sumTunedCleared += trun.totalCleared;
+        }
+
+        System.out.println("\n==== Monte Carlo (stochastic Poisson) summary over " + runs + " runs ====");
+        System.out.println("Static      : mean avgWait=" + (sumStaticWait / runs) + " mean cleared=" + (sumStaticCleared / runs));
+        System.out.println("Dynamic     : mean avgWait=" + (sumDynamicWait / runs) + " mean cleared=" + (sumDynamicCleared / runs));
+        System.out.println("Subtractive : mean avgWait=" + (sumSubWait / runs) + " mean cleared=" + (sumSubCleared / runs));
+        System.out.println("Tuned       : mean avgWait=" + (sumTunedWait / runs) + " mean cleared=" + (sumTunedCleared / runs));
+    }
+}
